@@ -29,115 +29,147 @@ def wa_link(phone: str, text: str):
 if page == "Dashboard":
     st.header("📊 Distributor Dashboard")
     m = kpis()
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Distributors", m["distributors"])
-    c2.metric("Active", m["active"])
-    c3.metric("Expired", m["expired"])
-    c4.metric("Inactive", m["inactive"])
+    c1.metric("Total Distributors", m.get("distributors", 0))
+    c2.metric("Active", m.get("active", 0))
+    c3.metric("Expired", m.get("expired", 0))
+    c4.metric("Inactive", m.get("inactive", 0))
 
     st.subheader("Levels 1–13")
     from db import get_conn
     with get_conn() as conn:
-        lvl_rows = conn.execute("SELECT level, COUNT(*) c FROM contacts WHERE distributor_status='Distributor' GROUP BY level ORDER BY level").fetchall()
+        lvl_rows = conn.execute(
+    "SELECT level, COUNT(*) c FROM contacts WHERE distributor_status='Distributor' GROUP BY level"
+).fetchall()
+
+
     import pandas as pd
-    lvl_df = pd.DataFrame(lvl_rows, columns=["level","count"])
+    lvl_df = pd.DataFrame(lvl_rows, columns=["level", "count"])
     if not lvl_df.empty:
         st.bar_chart(lvl_df.set_index("level"))
     else:
-        st.info("No distributors yet. Import your downline using Import / Export.")
+        st.info("No distributors yet. Import your downline on the Import / Export page.")
 
+# --- CONTACTS ---
 elif page == "Contacts":
-    st.header("👥 Contacts (Existing Distributors)")
-    st.caption("This list mirrors your APLGO downline. Schema follows the provided sample XLS.")
+    st.header("👥 Contacts")
+    with st.expander("➕ Add / Edit Contact", expanded=True):
+        mode = st.radio("Mode", ["Add","Edit","Delete"], horizontal=True)
+        if mode == "Add":
+            with st.form("add_contact"):
+                name = st.text_input("Name *")
+                phone = st.text_input("Phone")
+                email = st.text_input("Email")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    source = st.text_input("Source (e.g., GRW, NRM, Referral)")
+                with c2:
+                    interest = st.text_input("Interest (e.g., Luna, GRW, STP, NRM)")
+                with c3:
+                    status = st.selectbox("Status", ["New","Warm","Hot","Customer","Inactive"], index=0)
+                tags = st.text_input("Tags (comma-separated)")
+                assigned = st.text_input("Assigned (rep/owner)", value="Vanto")
+                notes = st.text_area("Notes", height=80)
+                submitted = st.form_submit_button("Save Contact")
+                if submitted and name:
+                    contact_id = insert_contact(dict(name=name, phone=phone, email=email, source=source, interest=interest, status=status, tags=tags, assigned=assigned, notes=notes))
+                    st.success(f"Saved contact #{contact_id}: {name}")
+        elif mode == "Edit":
+            rows = fetch_contacts()
+            options = {f"#{r[0]} {r[1]} • {r[2] or ''}": r for r in rows}
+            sel = st.selectbox("Select contact", list(options.keys())) if options else None
+            if sel:
+                r = options[sel]
+                with st.form("edit_contact"):
+                    name = st.text_input("Name *", r[1])
+                    phone = st.text_input("Phone", r[2] or "")
+                    email = st.text_input("Email", r[3] or "")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        source = st.text_input("Source", r[4] or "")
+                    with c2:
+                        interest = st.text_input("Interest", r[5] or "")
+                    with c3:
+                        status = st.selectbox("Status", ["New","Warm","Hot","Customer","Inactive"], index=["New","Warm","Hot","Customer","Inactive"].index(r[6] or "New"))
+                    tags = st.text_input("Tags", r[7] or "")
+                    assigned = st.text_input("Assigned", r[8] or "")
+                    notes = st.text_area("Notes", r[9] or "", height=80)
+                    submitted = st.form_submit_button("Update Contact")
+                    if submitted and name:
+                        update_contact(r[0], dict(name=name, phone=phone, email=email, source=source, interest=interest, status=status, tags=tags, assigned=assigned, notes=notes))
+                        st.success("Contact updated.")
+        else:  # Delete
+            rows = fetch_contacts()
+            options = {f"#{r[0]} {r[1]} • {r[2] or ''}": r for r in rows}
+            sel = st.selectbox("Select contact to delete", list(options.keys())) if options else None
+            if sel and st.button("Delete Contact", type="primary"):
+                r = options[sel]
+                delete_contact(r[0])
+                st.warning(f"Deleted contact #{r[0]} {r[1]}")
 
-    # Filters
-    q = st.text_input("Search name / phone / email / Associate ID", "")
-    col1, col2, col3, col4 = st.columns(4)
-    member_status = col1.multiselect("Member Status", ["Active","Expired"], default=["Active","Expired"])
-    distributor_status = col2.multiselect("Distributor Status", ["Distributor","Inactive"], default=["Distributor","Inactive"])
-    levels = col3.multiselect("Levels (1–13)", list(range(1,14)))
-    leg_filter = col4.text_input("Leg (optional)", "")
-
-    filters = {"q": q.strip() or None,
-               "member_status": member_status or None,
-               "distributor_status": distributor_status or None,
-               "levels": levels or None,
-               "legs": [leg_filter] if leg_filter else None}
-
-    from db import fetch_contacts, insert_contact, update_contact, delete_contact
-    data = fetch_contacts({k:v for k,v in filters.items() if v})
-    import pandas as pd
-    df = pd.DataFrame(data)
-
-    # Create / Edit
-    with st.expander("➕ Add or Edit Distributor"):
-        mode = st.radio("Mode", ["Add New","Edit Existing"], horizontal=True)
-        if mode == "Edit Existing" and not df.empty:
-            options = {f'{r["name"]} ({r.get("phone","")})': r["id"] for _, r in df.iterrows()}
-            sel = st.selectbox("Pick a contact", list(options.keys()))
-            sel_id = options[sel]
-            rec = df[df["id"]==sel_id].iloc[0].to_dict()
-        else:
-            rec = {"level":1,"leg":"","associate_id":"","name":"","member_status":"Active","distributor_status":"Distributor","location":"","phone":"","email":"","tags":""}
-
-        c1, c2, c3 = st.columns(3)
-        rec["level"] = c1.number_input("Level", min_value=1, max_value=13, value=int(rec.get("level") or 1), step=1)
-        rec["leg"] = c2.text_input("Leg", rec.get("leg",""))
-        rec["associate_id"] = c3.text_input("Associate ID", rec.get("associate_id",""))
-        rec["name"] = st.text_input("Name and surname", rec.get("name",""))
-        c4, c5, c6 = st.columns(3)
-        rec["member_status"] = c4.selectbox("Member Status", ["Active","Expired"], index=0 if rec.get("member_status","Active")=="Active" else 1)
-        rec["distributor_status"] = c5.selectbox("Distributor Status", ["Distributor","Inactive"], index=0 if rec.get("distributor_status","Distributor")=="Distributor" else 1)
-        rec["location"] = c6.text_input("Location", rec.get("location",""))
-        c7, c8, c9 = st.columns(3)
-        rec["phone"] = c7.text_input("Phone", rec.get("phone",""))
-        rec["email"] = c8.text_input("E-mail", rec.get("email",""))
-        rec["tags"] = c9.text_input("Tags (comma-separated)", rec.get("tags",""))
-
-        cc1, cc2, cc3 = st.columns(3)
-        if cc1.button("Save"):
-            if mode == "Edit Existing":
-                update_contact(int(sel_id), rec)
-                st.success("Updated distributor.")
-            else:
-                insert_contact(rec)
-                st.success("Added distributor.")
-        if mode == "Edit Existing":
-            if cc3.button("Delete"):
-                delete_contact(int(sel_id))
-                st.warning("Distributor deleted.")
-
-    # Table
-    if df.empty:
-        st.info("No data. Import from your sample XLS on the Import / Export page.")
+    st.subheader("Search & Filter")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        search = st.text_input("Search", placeholder="Name, phone, email, interest, notes...")
+    with col2:
+        status_f = st.selectbox("Status filter", ["","New","Warm","Hot","Customer","Inactive"])
+    with col3:
+        tag_f = st.text_input("Tag filter")
+    rows = fetch_contacts(search=search, status=status_f, tag=tag_f)
+    if rows:
+        df = pd.DataFrame(rows, columns=["ID","Name","Phone","Email","Source","Interest","Status","Tags","Assigned","Notes","Created"])
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        st.dataframe(df[["level","leg","associate_id","name","member_status","distributor_status","location","phone","email","tags"]].sort_values(["level","name"]))
+        st.info("No contacts found.")
 
-
+# --- ORDERS ---
 elif page == "Orders":
     st.header("🧾 Orders")
-    rows = fetch_contacts()
-    contact_map = {f"#{r[0]} {r[1]}": r[0] for r in rows}
-    with st.form("add_order"):
-        contact_sel = st.selectbox("Contact", list(contact_map.keys())) if contact_map else None
-        product = st.text_input("Product (e.g., STP, NRM, Luna)")
-        qty = st.number_input("Quantity", min_value=1, value=1, step=1)
-        amount = st.number_input("Amount (ZAR)", min_value=0.0, step=1.0)
-        status = st.selectbox("Status", ["Pending","Paid","Shipped","Delivered"], index=0)
-        pop_url = st.text_input("POP URL (optional)")
-        notes = st.text_area("Notes", height=80)
-        submitted = st.form_submit_button("Add Order")
-        if submitted and contact_sel:
-            insert_order(dict(contact_id=contact_map[contact_sel], product=product, quantity=int(qty), amount=float(amount), status=status, pop_url=pop_url, notes=notes))
-            st.success("Order added.")
 
-    st.subheader("Recent Orders")
-    o_rows = fetch_orders()
-    if o_rows:
-        o_df = pd.DataFrame(o_rows, columns=["ID","ContactID","Contact","Product","Qty","Amount","Status","POP","Notes","Created"])
-        st.dataframe(o_df, use_container_width=True, hide_index=True)
+    # Load contacts (dict rows, not tuples)
+    rows = fetch_contacts({})
+    if not rows:
+        st.info("No contacts yet. Add or import contacts first.")
     else:
-        st.info("No orders yet.")
+        # Build dropdown: "Name (Phone)" -> id
+        contact_map = {
+            f"{r.get('name','[No Name]')} ({r.get('phone','')})": r["id"]
+            for r in rows
+        }
+        sel = st.selectbox("Select distributor", list(contact_map.keys()))
+        contact_id = contact_map[sel]
+
+        # New order form
+        with st.form("new_order"):
+            order_date = st.date_input("Order date")
+            product = st.text_input("Product")
+            qty = st.number_input("Qty", min_value=1, step=1, value=1)
+            amount = st.number_input("Amount", min_value=0.0, step=10.0, value=0.0, format="%.2f")
+            notes = st.text_area("Notes", "")
+            submitted = st.form_submit_button("Add order")
+            if submitted:
+                insert_order({
+                    "contact_id": contact_id,
+                    "order_date": str(order_date),
+                    "product": product.strip(),
+                    "qty": int(qty),
+                    "amount": float(amount),
+                    "notes": notes.strip(),
+                })
+                st.success("Order added.")
+
+        # Show recent orders (with contact names)
+        import pandas as pd
+        id_to_name = {r["id"]: r.get("name","") for r in rows}
+        orders = fetch_orders()
+        if not orders:
+            st.info("No orders yet.")
+        else:
+            df = pd.DataFrame(orders)
+            if "contact_id" in df.columns:
+                df.insert(1, "contact_name", df["contact_id"].map(id_to_name).fillna(""))
+            st.dataframe(df)
 
 # --- CAMPAIGNS ---
 elif page == "Campaigns":
@@ -166,77 +198,110 @@ elif page == "Campaigns":
 # --- WHATSAPP TOOLS ---
 elif page == "WhatsApp Tools":
     st.header("💬 WhatsApp Tools")
-    st.write("Create one-click WhatsApp messages with your templates.")
-    template = st.text_area("Template", value=("Hi 👋 {name}, it’s Vanto from APLGO SA.\n"
-                                               "Your R375 membership expired, but exciting news — MyAPL World is here 🌍, plus our new product Luna 🌙, multicurrency payouts 💱, and the same powerful lozenges you love 🍃.\n"
-                                               "Life has seasons — your door to APLGO is open again! 🔑\n"
-                                               "Rejoin here 👉 https://myaplworld.com/pages.cfm?p=CC1809B8\n"
-                                               "We’ve kept your seat warm 🔥"))
-    rows = fetch_contacts()
-    if rows:
-        st.subheader("Pick a contact")
-        lookup = {f"#{r[0]} {r[1]}": r for r in rows}
-        sel = st.selectbox("Contact", list(lookup.keys()))
-        r = lookup[sel]
-        filled = template.format(
-            name=r[1], phone=r[2] or "", interest=r[5] or "", status=r[6] or "", tags=r[7] or "", assigned=r[8] or ""
-        )
-        link = wa_link(r[2] or "", filled)
-        st.markdown(f"[Open WhatsApp message ↗]({link})")
-        st.code(filled)
-        # Log activity
-        if st.button("Log as Activity (WhatsApp)"):
-            insert_activity(dict(contact_id=r[0], activity_date=None, type="whatsapp", summary="Sent template", details=filled))
-            st.success("Activity logged.")
-    else:
+    template = st.text_area(
+        "Template",
+        value=("Hi {name}…")
+    )
+
+    # 1) Get contacts (use {} to show everyone)
+    rows = fetch_contacts({"distributor_status": ["Distributor"]})
+
+    # 2) If none, show info
+    if not rows:
         st.info("Add contacts first.")
+    else:
+        # 3) Pick a contact
+        st.subheader("Pick a contact")
+        options = {
+            f"{r.get('name','[No Name]')} ({r.get('phone','')})": r["id"]
+            for r in rows
+        }
+        sel_label = st.selectbox("Contact", list(options.keys()))
+        sel_id = options[sel_label]
+        rec = next(r for r in rows if r["id"] == sel_id)
+
+        # 4) Fill the template
+        filled = template.format(
+            name=rec.get("name", ""),
+            phone=rec.get("phone", ""),
+            level=rec.get("level", ""),
+            id=rec.get("associate_id", ""),
+        )
+
+        # 5) Normalize phone and build wa.me link
+        import re
+        def normalize_phone(p: str) -> str:
+            d = re.sub(r"\D", "", str(p))
+            if d.startswith("0"):
+                d = "27" + d[1:]
+            return d
+
+        wa_num = normalize_phone(rec.get("phone", ""))
+        wa_url = f"https://wa.me/{wa_num}?text={quote_plus(filled)}"
+
+        st.markdown(f"[✅ Open WhatsApp message ↗]({wa_url})")
+        st.code(filled)
+
+        # 6) Log activity
+        if st.button("Log as Activity (WhatsApp)"):
+            insert_activity(rec["id"], "whatsapp", filled)
+            st.success("Activity logged.")
 
 # --- IMPORT / EXPORT ---
 elif page == "Import / Export":
-    st.header("📥 Import / Export")
-    st.write("Import contacts from CSV/Excel. Columns auto-detected: name, phone, email, source, interest, status, tags, assigned, notes.")
-    upl = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx"])
-    if upl is not None:
-        if upl.name.endswith(".csv"):
-            df = pd.read_csv(upl)
-        else:
-            df = pd.read_excel(upl)
-        st.write("Preview:")
-        st.dataframe(df.head(), use_container_width=True)
-        # Map columns
-        default_map = {
-            "name":"name","phone":"phone","email":"email","source":"source","interest":"interest",
-            "status":"status","tags":"tags","assigned":"assigned","notes":"notes"
-        }
-        st.write("Map your columns to CRM fields:")
-        crm_fields = list(default_map.keys())
-        col_map = {}
-        for f in crm_fields:
-            options = ["--"] + list(df.columns)
-            guess = next((c for c in df.columns if c.lower().strip().replace(" ","") == f), None)
-            col_map[f] = st.selectbox(f"{f}", options, index=(options.index(guess) if guess in options else 0), key=f"map_{f}")
-        if st.button("Import Now", type="primary"):
-            cnt = 0
-            for _, row in df.iterrows():
-                data = {}
-                for f, col in col_map.items():
-                    if col != "--":
-                        data[f] = str(row[col]) if not pd.isna(row[col]) else ""
-                    else:
-                        data[f] = ""
-                # require at least name or phone
-                if data.get("name") or data.get("phone"):
-                    insert_contact(data)
-                    cnt += 1
-            st.success(f"Imported {cnt} contacts.")
-    st.divider()
-    st.subheader("Export")
-    exp_rows = fetch_contacts()
-    if exp_rows:
-        exp_df = pd.DataFrame(exp_rows, columns=["ID","Name","Phone","Email","Source","Interest","Status","Tags","Assigned","Notes","Created"])
-        st.download_button("Download Contacts CSV", exp_df.to_csv(index=False).encode("utf-8"), "contacts_export.csv", "text/csv")
+    st.header("📥 Import / Export — Distributors")
+    st.caption("Upload your CSV/XLSX following the sample headers. We'll auto-map and import into the Distributor-focused Contacts.")
 
-# --- HELP ---
+    expected = ['Level','Leg',"Associate's ID",'Name and surname','GO status','Location','Phone','E-mail','Tags (comma-separated)']
+    st.markdown("**Expected headers:** " + ", ".join([f"`{c}`" for c in expected]))
+
+    tab1, tab2 = st.tabs(["Import distributors", "Export distributors"])
+
+    with tab1:
+        file = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx"])
+        if file is not None:
+            import pandas as pd
+            name = file.name.lower()
+            try:
+                if name.endswith(".csv"):
+                    df = pd.read_csv(file)
+                else:
+                    df = pd.read_excel(file)
+                st.success(f"Loaded file with {len(df)} rows.")
+                st.dataframe(df.head(20))
+                if st.button("Import now"):
+                    from db import bulk_upsert_from_dataframe
+                    bulk_upsert_from_dataframe(df)
+                    st.success("Import complete. Contacts updated.")
+            except Exception as e:
+                st.error(f"Failed to read file: {e}")
+
+    with tab2:
+        from db import fetch_contacts
+        data = fetch_contacts({})
+        import pandas as pd
+        if not data:
+            st.info("No contacts yet to export.")
+        else:
+            df = pd.DataFrame(data)
+            rename = {
+                "level": "Level",
+                "leg": "Leg",
+                "associate_id": "Associate's ID",
+                "name": "Name and surname",
+                "member_status": "GO status",
+                "location": "Location",
+                "phone": "Phone",
+                "email": "E-mail",
+                "tags": "Tags (comma-separated)",
+            }
+            for k in list(rename.keys()):
+                if k not in df.columns:
+                    df[k] = ""
+            out = df[list(rename.keys())].rename(columns=rename)
+            st.dataframe(out.head(20))
+            st.download_button("Download CSV", data=out.to_csv(index=False), file_name="contacts_export.csv", mime="text/csv")
+
 elif page == "Help":
     st.header("🚀 How to run this CRM")
     st.markdown("""
