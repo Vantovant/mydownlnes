@@ -1,259 +1,158 @@
+# db.py — robust SQLite helpers (cloud-safe)
+# Drop-in file. Paste over your current db.py.
+
+import os
 import sqlite3
-from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Dict, Any
-import pandas as pd
+from typing import Dict, List, Any, Iterable
 
-DB_PATH = Path(__file__).with_name("crm.sqlite3")
+# -------- DB location (works local & Streamlit Cloud) --------
+if os.environ.get("HOME", "").endswith("appuser"):  # Cloud container user
+    DB_PATH = Path("/tmp/crm.sqlite3")
+else:
+    DB_PATH = Path(__file__).parent / "crm.sqlite3"
 
-SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
+# -------- Columns (agreed schema) --------
+CONTACT_COLUMNS: List[str] = [
+    "name", "phone", "email",
+    "source", "interest",
+    "lead_temperature",
+    "communication_status",
+    "registration_status",
+    "tags", "assigned", "notes",
+    "action_needed", "action_taken",
+    "username", "password",
+    "date", "country", "province", "city",
+]
 
-CREATE TABLE IF NOT EXISTS contacts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    level INTEGER CHECK(level BETWEEN 1 AND 13),
-    leg TEXT,
-    associate_id TEXT,
-    name TEXT NOT NULL,
-    member_status TEXT CHECK(member_status IN ('Active','Expired')) DEFAULT 'Active',
-    distributor_status TEXT CHECK(distributor_status IN ('Distributor','Inactive')) DEFAULT 'Distributor',
-    location TEXT,
-    phone TEXT UNIQUE,
-    email TEXT,
-    tags TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    contact_id INTEGER,
-    order_date TEXT,
-    product TEXT,
-    qty INTEGER DEFAULT 1,
-    amount REAL DEFAULT 0,
-    notes TEXT,
-    FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE SET NULL
-);
-
-CREATE TABLE IF NOT EXISTS activities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    contact_id INTEGER,
-    channel TEXT,
-    message TEXT,
-    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS campaigns (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
-
-TRIGGERS_SQL = """
-CREATE TRIGGER IF NOT EXISTS contacts_updated_at
-AFTER UPDATE ON contacts
-FOR EACH ROW
-BEGIN
-    UPDATE contacts SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
-END;
-"""
-
-@contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+def _conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    return conn
+
+# -------- Utilities --------
+def _is_nan(x: Any) -> bool:
     try:
-        yield conn
-    finally:
-        conn.commit()
-        conn.close()
+        return x != x  # NaN != NaN
+    except Exception:
+        return False
 
-def init_db():
-    with get_conn() as conn:
-        conn.executescript(SCHEMA_SQL)
-        conn.executescript(TRIGGERS_SQL)
+def _to_text(v: Any) -> str:
+    """Normalize ANY value to a safe string for SQLite."""
+    if v is None or _is_nan(v):
+        return ""
+    # flatten lists/tuples/sets from multiselects
+    if isinstance(v, (list, tuple, set)):
+        return ", ".join(_to_text(x) for x in v)
+    # everything else
+    return str(v)
 
-def row_to_dict(row) -> dict:
-    return {k: row[k] for k in row.keys()}
+def _clean_row(row: Dict[str, Any]) -> Dict[str, str]:
+    return {c: _to_text(row.get(c, "")) for c in CONTACT_COLUMNS}
 
-# --- CONTACTS CRUD ---
-# --- helper (place once near the top of db.py, below imports) ---
-def _normalize_phone(p):
-    """
-    Normalise to +27… for SA:
-      0831234567  -> +27831234567
-      27XXXXXXXXX -> +27XXXXXXXXX
-    Blank/None stays as None.
-    """
-    if p is None or str(p).strip() == "":
-        return None
-    s = "".join(ch for ch in str(p) if ch.isdigit())
-    if not s:
-        return None
-    if s.startswith("0") and len(s) == 10:
-        s = "27" + s[1:]
-    if not s.startswith("+"):
-        s = "+" + s
-    return s
+# -------- Schema --------
+def ensure_schema() -> None:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT, phone TEXT, email TEXT,
+            source TEXT, interest TEXT,
+            lead_temperature TEXT,
+            communication_status TEXT,
+            registration_status TEXT,
+            tags TEXT, assigned TEXT, notes TEXT,
+            action_needed TEXT, action_taken TEXT,
+            username TEXT, password TEXT,
+            date TEXT, country TEXT, province TEXT, city TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT
+        );
+    """)
+    cur.execute("PRAGMA table_info(contacts);")
+    existing = {row["name"] for row in cur.fetchall()}
+    for col in CONTACT_COLUMNS:
+        if col not in existing:
+            cur.execute(f"ALTER TABLE contacts ADD COLUMN {col} TEXT;")
+    if "created_at" not in existing:
+        cur.execute("ALTER TABLE contacts ADD COLUMN created_at TEXT;")
+    if "updated_at" not in existing:
+        cur.execute("ALTER TABLE contacts ADD COLUMN updated_at TEXT;")
+    conn.commit()
+    conn.close()
 
-# --- REPLACE YOUR EXISTING FUNCTION WITH THIS ---
-def insert_contact(rec: dict) -> None:
-    rec = dict(rec)  # don't mutate callers
-    # 1) normalise phone or keep None (avoids UNIQUE '' clashes)
-    rec["phone"] = _normalize_phone(rec.get("phone"))
+# Back-compat for older imports
+def init_db() -> None:
+    ensure_schema()
 
-    # 2) build columns/values ignoring None
-    keys = [k for k, v in rec.items() if v is not None]
-    vals = [rec[k] for k in keys]
-    cols = ",".join(keys)
-    placeholders = ",".join(["?"] * len(keys))
+# -------- CRUD --------
+def insert_contact(row: Dict[str, Any]) -> int:
+    ensure_schema()
+    payload = _clean_row(row)
+    cols = ", ".join(CONTACT_COLUMNS)
+    ph = ", ".join(["?"] * len(CONTACT_COLUMNS))
+    vals = [payload[c] for c in CONTACT_COLUMNS]
+    sql = f"INSERT INTO contacts ({cols}) VALUES ({ph})"
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(sql, vals)
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
 
-    # 3) UPSERT on phone (update existing instead of crashing)
-    set_parts = []
-    for k in keys:
-        if k in ("id", "phone"):
-            continue
-        # don't overwrite existing values with empty strings
-        set_parts.append(f"{k}=COALESCE(NULLIF(excluded.{k}, ''), {k})")
+def insert_one_contact(row: Dict[str, Any]) -> int:  # alias
+    return insert_contact(row)
 
-    sql = f"INSERT INTO contacts ({cols}) VALUES ({placeholders})"
-    if "phone" in keys and set_parts:
-        sql += " ON CONFLICT(phone) DO UPDATE SET " + ", ".join(set_parts)
+def insert_contacts(rows: Iterable[Dict[str, Any]]) -> int:
+    ensure_schema()
+    rows = list(rows or [])
+    if not rows:
+        return 0
+    data = [[_to_text(r.get(c, "")) for c in CONTACT_COLUMNS] for r in rows]
+    cols = ", ".join(CONTACT_COLUMNS)
+    ph = ", ".join(["?"] * len(CONTACT_COLUMNS))
+    sql = f"INSERT INTO contacts ({cols}) VALUES ({ph})"
+    conn = _conn()
+    cur = conn.cursor()
+    cur.executemany(sql, data)
+    conn.commit()
+    n = cur.rowcount if cur.rowcount is not None else len(rows)
+    conn.close()
+    return n
 
-    conn = get_conn()
-    with conn:
-        conn.execute(sql, vals)
-
-def update_contact(contact_id: int, data: dict):
-    allowed = ["level","leg","associate_id","name","member_status","distributor_status","location","phone","email","tags"]
-    sets, vals = [], []
-    for k,v in data.items():
-        if k in allowed:
-            sets.append(f"{k}=?")
-            vals.append(v)
-    if not sets:
+def update_contact(contact_id: int, updates: Dict[str, Any]) -> None:
+    ensure_schema()
+    safe = {k: _to_text(v) for k, v in (updates or {}).items() if k in CONTACT_COLUMNS}
+    if not safe:
         return
-    vals.append(contact_id)
-    with get_conn() as conn:
-        conn.execute(f"UPDATE contacts SET {', '.join(sets)} WHERE id=?", vals)
+    sets = ", ".join([f"{k}=?" for k in safe.keys()])
+    vals = list(safe.values()) + [contact_id]
+    conn = _conn()
+    conn.execute(f"UPDATE contacts SET {sets}, updated_at=datetime('now') WHERE id=?", vals)
+    conn.commit()
+    conn.close()
 
-def delete_contact(contact_id: int):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM contacts WHERE id=?", (contact_id,))
+def delete_contact(contact_id: int) -> None:
+    ensure_schema()
+    conn = _conn()
+    conn.execute("DELETE FROM contacts WHERE id=?", (contact_id,))
+    conn.commit()
+    conn.close()
 
-def fetch_contacts(filters: dict=None) -> list:
-    filters = filters or {}
-    sql = "SELECT * FROM contacts WHERE 1=1"
-    params = []
-    q = filters.get("q")
-    if q:
-        sql += " AND (name LIKE ? OR phone LIKE ? OR email LIKE ? OR associate_id LIKE ?)"
-        like = f"%{q}%"
-        params += [like, like, like, like]
-    ms = filters.get("member_status")
-    if ms:
-        sql += " AND member_status IN (%s)" % ",".join(["?"]*len(ms))
-        params += list(ms)
-    ds = filters.get("distributor_status")
-    if ds:
-        sql += " AND distributor_status IN (%s)" % ",".join(["?"]*len(ds))
-        params += list(ds)
-    lv = filters.get("levels")
-    if lv:
-        sql += " AND level IN (%s)" % ",".join(["?"]*len(lv))
-        params += list(lv)
-    legs = filters.get("legs")
-    if legs:
-        sql += " AND leg IN (%s)" % ",".join(["?"]*len(legs))
-        params += list(legs)
-    sql += " ORDER BY level ASC, name ASC"
-    with get_conn() as conn:
-        rows = conn.execute(sql, params).fetchall()
-        return [row_to_dict(r) for r in rows]
+def delete_all_contacts() -> None:
+    ensure_schema()
+    conn = _conn()
+    conn.execute("DELETE FROM contacts;")
+    conn.commit()
+    conn.close()
 
-def bulk_upsert_from_dataframe(df):
-    # Expect columns matching the sample: Level, Leg, Associate's ID, Name and surname, GO status, Location, Phone, E-mail, Tags (comma-separated)
-    df2 = df.copy()
-    df2.columns = [str(c).strip() for c in df2.columns]
-    rename = {
-        "Level": "level",
-        "Leg": "leg",
-        "Associate's ID": "associate_id",
-        "Name and surname": "name",
-        "GO status": "member_status",
-        "Location": "location",
-        "Phone": "phone",
-        "E-mail": "email",
-        "Tags (comma-separated)": "tags",
-    }
-    for src, dst in rename.items():
-        if src in df2.columns:
-            df2.rename(columns={src: dst}, inplace=True)
-    df2["distributor_status"] = "Distributor"
-    # normalize member_status
-    if "member_status" in df2.columns:
-        df2["member_status"] = df2["member_status"].astype(str).str.strip().str.capitalize().replace({"Expired":"Expired","Active":"Active"})
-    else:
-        df2["member_status"] = "Active"
-    # level to int 1..13
-    if "level" in df2.columns:
-        df2["level"] = pd.to_numeric(df2["level"], errors="coerce").fillna(1).astype(int).clip(1,13)
-    # upsert
-    with get_conn() as conn:
-        for _, r in df2.iterrows():
-            rec = {k: (None if pd.isna(r.get(k)) else r.get(k)) for k in ["level","leg","associate_id","name","member_status","distributor_status","location","phone","email","tags"]}
-            if rec.get("phone"):
-                exist = conn.execute("SELECT id FROM contacts WHERE phone=?", (rec["phone"],)).fetchone()
-            else:
-                exist = conn.execute("SELECT id FROM contacts WHERE associate_id=? AND name=?", (rec.get("associate_id"), rec.get("name"))).fetchone()
-            if exist:
-                conn.execute("""UPDATE contacts SET level=?, leg=?, associate_id=?, name=?, member_status=?, distributor_status=?, location=?, phone=?, email=?, tags=? WHERE id=?""",                             (rec["level"], rec["leg"], rec["associate_id"], rec["name"], rec["member_status"], rec["distributor_status"], rec["location"], rec["phone"], rec["email"], rec["tags"], exist["id"])) 
-            else:
-                conn.execute("""INSERT INTO contacts(level,leg,associate_id,name,member_status,distributor_status,location,phone,email,tags) VALUES(?,?,?,?,?,?,?,?,?,?)""",                             (rec["level"], rec["leg"], rec["associate_id"], rec["name"], rec["member_status"], rec["distributor_status"], rec["location"], rec["phone"], rec["email"], rec["tags"]))
-
-# --- ORDERS ---
-def insert_order(data: dict) -> int:
-    with get_conn() as conn:
-        cur = conn.execute("""INSERT INTO orders(contact_id,order_date,product,qty,amount,notes) VALUES(?,?,?,?,?,?)""",                           (data.get("contact_id"), data.get("order_date"), data.get("product"), data.get("qty",1), data.get("amount",0.0), data.get("notes")))
-        return cur.lastrowid
-
-def fetch_orders() -> list:
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM orders ORDER BY order_date DESC, id DESC").fetchall()
-        return [row_to_dict(r) for r in rows]
-
-# --- ACTIVITIES & CAMPAIGNS ---
-def insert_activity(contact_id: int, channel: str, message: str):
-    with get_conn() as conn:
-        conn.execute("INSERT INTO activities(contact_id, channel, message) VALUES(?,?,?)", (contact_id, channel, message))
-
-def fetch_activities(contact_id: int=None) -> list:
-    with get_conn() as conn:
-        if contact_id:
-            rows = conn.execute("SELECT * FROM activities WHERE contact_id=? ORDER BY ts DESC", (contact_id,)).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM activities ORDER BY ts DESC").fetchall()
-        return [row_to_dict(r) for r in rows]
-
-def insert_campaign(name: str) -> int:
-    with get_conn() as conn:
-        cur = conn.execute("INSERT INTO campaigns(name) VALUES(?)", (name,))
-        return cur.lastrowid
-
-def fetch_campaigns() -> list:
-    with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM campaigns ORDER BY created_at DESC").fetchall()
-        return [row_to_dict(r) for r in rows]
-
-def kpis() -> dict:
-    with get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) c FROM contacts").fetchone()["c"]
-        active = conn.execute("SELECT COUNT(*) c FROM contacts WHERE member_status='Active'").fetchone()["c"]
-        expired = conn.execute("SELECT COUNT(*) c FROM contacts WHERE member_status='Expired'").fetchone()["c"]
-        distributors = conn.execute("SELECT COUNT(*) c FROM contacts WHERE distributor_status='Distributor'").fetchone()["c"]
-        inactive = conn.execute("SELECT COUNT(*) c FROM contacts WHERE distributor_status='Inactive'").fetchone()["c"]
-        orders = conn.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"]
-        return {"total_contacts": total, "active": active, "expired": expired, "distributors": distributors, "inactive": inactive, "orders": orders}
+def fetch_contacts() -> List[Dict[str, Any]]:
+    ensure_schema()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM contacts ORDER BY id DESC;")
+    out = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return out
