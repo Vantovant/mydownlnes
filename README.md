@@ -1,32 +1,23 @@
 
-# Vanto CRM (Local, Laptop-First)
+# Vanto CRM — Distributor Upgrade
 
-This is a lightweight, Nimble-style CRM you can run **entirely on your laptop**.  
-Stack: **Python + Streamlit + SQLite**. No monthly fees, no cloud dependency.
+This package keeps your original navigation (Orders, Campaigns, WhatsApp Tools, Import/Export, Help) **unchanged** while upgrading:
+- **Dashboard**: focused on existing distributors.
+- **Contacts**: matches your sample XLS schema. Removes **Source** and **Interest**. Adds **Member Status (Active/Expired)** and **Distributor Status (Distributor/Inactive)**.
 
-## Features
-- Contacts with status (New/Warm/Hot/Customer/Inactive), tags, owner, notes
-- Orders linked to contacts (revenue tracking)
-- Campaign log (WhatsApp, Facebook, TikTok, Email)
-- WhatsApp Tools: one-click message links with templates + activity logging
-- Import/Export (CSV/XLSX)
-- Simple dashboard KPIs
+## Contacts schema (database)
+- level (1–13), leg, associate_id, name, member_status (Active/Expired), distributor_status (Distributor/Inactive), location, phone, email, tags
 
-## Run
-1. Install Python 3.10+
-2. Open terminal in this folder and run:
+## Import template
+See `v3_contacts_import_template.csv`. It mirrors your sample.
 
+## Install / Run (localhost)
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
+Open: http://localhost:8501
 
-## Data
-- SQLite database file `crm.sqlite3` is created automatically.
-- Back up by copying this file.
-
-## Importing Your Existing Spreadsheet
-Use the **Import / Export** page to upload your XLSX/CSV. Map columns to CRM fields and click **Import**.
-
-## Customize
-Open `db.py` to add fields or new tables. Extend `app.py` to add pages like **WhatsApp Group Manager** or **Registrations**.
+## Notes
+- WhatsApp and Orders pages were preserved from your original ZIP.
+- Status filter now uses **Distributor / Inactive** only.
